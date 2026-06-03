@@ -8,9 +8,13 @@
     2025-06-01,1回戦,Taro,3,Jiro,1,0,
     2025-06-01,準決勝,Saburo,1,Shiro,1,1,Saburo
 
-    round: 1回戦 / 2回戦 / 準決勝 / 決勝  （設定画面で自由に追加可）
-    pk:    PK戦あり=1, なし=0
-    pk_winner: PK勝者の選手名（pk=0なら空欄）
+    round:      1回戦 / 2回戦 / 準決勝 / 決勝  （設定画面で自由に追加可）
+    pk:         PK戦あり=1, なし=0
+    pk_winner:  PK勝者の選手名（pk=0なら空欄）
+
+シード選手:
+    サイドバーの「シード選手」欄に名前を入力（カンマ区切りで複数可）。
+    1回戦終了後に1回戦参加者の平均獲得ポイントが自動付与されます。
 
 選手アイコン:
     icons/ フォルダに「選手名.png」(.jpg/.jpeg/.webp も可) を置くと表示されます。
@@ -43,42 +47,59 @@ st.set_page_config(page_title="⚽ Soccer Ranking", page_icon="⚽", layout="wid
 # ──────────────────────────────────────────────
 # ポイント計算ロジック
 # ──────────────────────────────────────────────
-def compute_points(matches: pd.DataFrame, round_config: dict):
+def compute_points(matches: pd.DataFrame, round_config: dict, seed_players: list):
     scores = {}   # {選手名: 累計ポイント}
-    stats  = {}   # {選手名: {games, wins, pk_wins, draws, losses, gf, ga}}
+    stats  = {}   # {選手名: {games, wins, pk_wins, draws, losses, gf, ga, seed, seed_bonus}}
     history_rows = []
+    seed_bonus_applied = False
+    SEED_ROUND = "1回戦"
 
     def ensure(name):
         if name not in scores:
             scores[name] = INITIAL_SCORE
-            stats[name]  = dict(games=0, wins=0, pk_wins=0, draws=0, losses=0, gf=0, ga=0)
+            stats[name]  = dict(games=0, wins=0, pk_wins=0, draws=0, losses=0,
+                                gf=0, ga=0, seed=name in seed_players, seed_bonus=0)
+
+    for p in seed_players:
+        ensure(p)
 
     matches = matches.sort_values("date").reset_index(drop=True)
 
     for idx, row in matches.iterrows():
-        a     = str(row["player_a"])
-        b     = str(row["player_b"])
-        sa    = int(row["score_a"])
-        sb    = int(row["score_b"])
+        a          = str(row["player_a"])
+        b          = str(row["player_b"])
+        sa         = int(row["score_a"])
+        sb         = int(row["score_b"])
         round_name = str(row["round"]).strip()
-        is_pk = bool(int(row["pk"])) if "pk" in matches.columns and str(row.get("pk","")).strip() not in ("","nan") else False
+        is_pk      = bool(int(row["pk"])) if "pk" in matches.columns and str(row.get("pk","")).strip() not in ("","nan") else False
         pk_winner  = str(row.get("pk_winner","")).strip() if "pk_winner" in matches.columns else ""
 
         ensure(a); ensure(b)
 
-        cfg = round_config.get(round_name, {"win": 10, "pk_win": 6, "gd_bonus": 2})
+        # 1回戦以外の試合が始まる直前にシードボーナスを付与
+        if not seed_bonus_applied and round_name != SEED_ROUND and seed_players:
+            first_round = matches[matches["round"] == SEED_ROUND]
+            if len(first_round) > 0:
+                fr_players = set(
+                    first_round["player_a"].astype(str).tolist() +
+                    first_round["player_b"].astype(str).tolist()
+                )
+                gains = [scores[p] - INITIAL_SCORE for p in fr_players if p in scores]
+                avg_gain = sum(gains) / len(gains) if gains else 0
+                for p in seed_players:
+                    scores[p] += avg_gain
+                    stats[p]["seed_bonus"] = round(avg_gain, 1)
+            seed_bonus_applied = True
+
+        cfg       = round_config.get(round_name, {"win": 10, "pk_win": 6, "gd_bonus": 2})
         win_pt    = cfg["win"]
         pk_win_pt = cfg["pk_win"]
         gd_bonus  = cfg["gd_bonus"]
 
-        # 得失点差（本戦のみ）
-        gd_a = sa - sb   # Aから見た得失点差
+        gd_a = sa - sb
         gd_b = sb - sa
 
-        # ポイント計算
         if is_pk:
-            # PK戦：本戦は引き分け扱い → 得失点差のみ両者に加算
-            # 勝者にpk_win_pt追加
             scores[a] += gd_a * gd_bonus
             scores[b] += gd_b * gd_bonus
             if pk_winner == a:
@@ -96,7 +117,7 @@ def compute_points(matches: pd.DataFrame, round_config: dict):
                 stats[b]["draws"] += 1
         elif sa > sb:
             scores[a] += win_pt + gd_a * gd_bonus
-            scores[b] += gd_b * gd_bonus          # 敗者は得失点差のみ（マイナスあり）
+            scores[b] += gd_b * gd_bonus
             stats[a]["wins"]   += 1
             stats[b]["losses"] += 1
         elif sa < sb:
@@ -105,7 +126,7 @@ def compute_points(matches: pd.DataFrame, round_config: dict):
             stats[b]["wins"]   += 1
             stats[a]["losses"] += 1
         else:
-            scores[a] += gd_a * gd_bonus  # 引き分け＆同点なら0
+            scores[a] += gd_a * gd_bonus
             scores[b] += gd_b * gd_bonus
             stats[a]["draws"] += 1
             stats[b]["draws"] += 1
@@ -120,6 +141,7 @@ def compute_points(matches: pd.DataFrame, round_config: dict):
         history_rows.append(snap)
 
     return scores, pd.DataFrame(history_rows), stats
+
 
 
 # ──────────────────────────────────────────────
@@ -172,6 +194,19 @@ def load_matches():
 # ──────────────────────────────────────────────
 # サイドバー：配点設定
 # ──────────────────────────────────────────────
+def build_seed_players():
+    st.sidebar.markdown("---")
+    st.sidebar.header("🌟 シード選手")
+    seed_input = st.sidebar.text_input(
+        "シード選手名（カンマ区切り）",
+        help="1回戦をスキップする選手。複数いる場合はカンマで区切ってください。例: Taro, Jiro"
+    )
+    seeds = [s.strip() for s in seed_input.split(",") if s.strip()] if seed_input else []
+    if seeds:
+        st.sidebar.info(f"シード: {', '.join(seeds)}")
+    return seeds
+
+
 def build_round_config(matches):
     st.sidebar.markdown("---")
     st.sidebar.header("⚙️ 配点設定")
@@ -217,10 +252,11 @@ def render_standings(scores, stats):
         delta = score - INITIAL_SCORE
         col_score.metric("ポイント", f"{score:.0f}", delta=f"{delta:+.0f}")
 
-        pk_str = f"（うちPK {s['pk_wins']}）" if s["pk_wins"] > 0 else ""
+        pk_str   = f"（うちPK {s['pk_wins']}）" if s["pk_wins"] > 0 else ""
+        seed_str = f"　🌟シード（ボーナス {s['seed_bonus']:+.1f}pt）" if s.get("seed") else ""
         col_record.markdown(
             f"**{s['wins']}**勝{pk_str} **{s['draws']}**分 **{s['losses']}**敗  \n"
-            f"得点 {s['gf']} / 失点 {s['ga']}　得失差 {s['gf']-s['ga']:+d}"
+            f"得点 {s['gf']} / 失点 {s['ga']}　得失差 {s['gf']-s['ga']:+d}{seed_str}"
         )
         st.divider()
 
@@ -276,6 +312,7 @@ def main():
     st.caption("ラウンド×勝敗×得失点差でポイントを計算します")
 
     matches = load_matches()
+    seed_players = build_seed_players()
     round_config = build_round_config(matches)
 
     if matches is None:
@@ -288,7 +325,7 @@ def main():
         )
         return
 
-    scores, history, stats = compute_points(matches, round_config)
+    scores, history, stats = compute_points(matches, round_config, seed_players)
 
     tab1, tab2, tab3 = st.tabs(["🏆 ランキング", "📈 ポイント変動", "📋 試合履歴"])
     with tab1:
