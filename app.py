@@ -35,10 +35,10 @@ ICON_DIR        = "icons"
 DEFAULT_CSV     = "matches.csv"
 
 DEFAULT_ROUNDS = {
-    "1回戦":  {"win": 10, "pk_win":  6, "gd_bonus": 2},
-    "2回戦":  {"win": 20, "pk_win": 12, "gd_bonus": 4},
-    "準決勝": {"win": 40, "pk_win": 24, "gd_bonus": 8},
-    "決勝":   {"win": 80, "pk_win": 48, "gd_bonus": 16},
+    "1回戦":  {"win": 10, "pk_win":  7, "gd_bonus": 1},
+    "2回戦":  {"win": 15, "pk_win": 12, "gd_bonus": 2},
+    "準決勝": {"win": 20, "pk_win": 17, "gd_bonus": 3},
+    "決勝":   {"win": 25, "pk_win": 22, "gd_bonus": 4},
 }
 
 st.set_page_config(page_title="⚽ Soccer Ranking", page_icon="⚽", layout="wide")
@@ -47,6 +47,13 @@ st.set_page_config(page_title="⚽ Soccer Ranking", page_icon="⚽", layout="wid
 # ──────────────────────────────────────────────
 # ポイント計算ロジック
 # ──────────────────────────────────────────────
+def opponent_multiplier(my_score: float, opp_score: float) -> float:
+    """相手レートに基づく補正係数（±20%以内）
+    強い相手に勝つほど係数>1、弱い相手には<1"""
+    diff = opp_score - my_score   # 正=相手が格上
+    return 1.0 + 0.2 * diff / 1000.0
+
+
 def compute_points(matches: pd.DataFrame, round_config: dict, seed_players: list):
     scores = {}   # {選手名: 累計ポイント}
     stats  = {}   # {選手名: {games, wins, pk_wins, draws, losses, gf, ga, seed, seed_bonus}}
@@ -76,7 +83,7 @@ def compute_points(matches: pd.DataFrame, round_config: dict, seed_players: list
 
         ensure(a); ensure(b)
 
-        # 1回戦以外の試合が始まる直前にシードボーナスを付与
+        # 1回戦以外の試合が始まる直前にシードボーナスを付与（1回戦勝ち扱い）
         if not seed_bonus_applied and round_name != SEED_ROUND and seed_players:
             first_round = matches[matches["round"] == SEED_ROUND]
             if len(first_round) > 0:
@@ -84,11 +91,26 @@ def compute_points(matches: pd.DataFrame, round_config: dict, seed_players: list
                     first_round["player_a"].astype(str).tolist() +
                     first_round["player_b"].astype(str).tolist()
                 )
-                gains = [scores[p] - INITIAL_SCORE for p in fr_players if p in scores]
-                avg_gain = sum(gains) / len(gains) if gains else 0
+                # 1回戦勝者の獲得ポイント平均を計算
+                winners = []
+                for _, fr_row in first_round.iterrows():
+                    fa, fb = str(fr_row["player_a"]), str(fr_row["player_b"])
+                    fsa, fsb = int(fr_row["score_a"]), int(fr_row["score_b"])
+                    fpk = bool(int(fr_row["pk"])) if "pk" in first_round.columns and str(fr_row.get("pk","")).strip() not in ("","nan") else False
+                    fpk_w = str(fr_row.get("pk_winner","")).strip() if "pk_winner" in first_round.columns else ""
+                    if fpk:
+                        winners.append(fpk_w if fpk_w else fa)
+                    elif fsa > fsb:
+                        winners.append(fa)
+                    elif fsb > fsa:
+                        winners.append(fb)
+                winner_gains = [scores[p] - INITIAL_SCORE for p in winners if p in scores]
+                avg_gain = sum(winner_gains) / len(winner_gains) if winner_gains else 0
                 for p in seed_players:
                     scores[p] += avg_gain
                     stats[p]["seed_bonus"] = round(avg_gain, 1)
+                    stats[p]["wins"]  += 1   # 1回戦勝ち扱い
+                    stats[p]["games"] += 1
             seed_bonus_applied = True
 
         cfg       = round_config.get(round_name, {"win": 10, "pk_win": 6, "gd_bonus": 2})
@@ -99,16 +121,20 @@ def compute_points(matches: pd.DataFrame, round_config: dict, seed_players: list
         gd_a = sa - sb
         gd_b = sb - sa
 
+        # 相手レート補正（勝利ポイント・PK勝利ポイントのみ適用）
+        mult_a = opponent_multiplier(scores[a], scores[b])
+        mult_b = opponent_multiplier(scores[b], scores[a])
+
         if is_pk:
             scores[a] += gd_a * gd_bonus
             scores[b] += gd_b * gd_bonus
             if pk_winner == a:
-                scores[a] += pk_win_pt
+                scores[a] += pk_win_pt * mult_a
                 stats[a]["wins"]    += 1
                 stats[a]["pk_wins"] += 1
                 stats[b]["losses"]  += 1
             elif pk_winner == b:
-                scores[b] += pk_win_pt
+                scores[b] += pk_win_pt * mult_b
                 stats[b]["wins"]    += 1
                 stats[b]["pk_wins"] += 1
                 stats[a]["losses"]  += 1
@@ -116,12 +142,12 @@ def compute_points(matches: pd.DataFrame, round_config: dict, seed_players: list
                 stats[a]["draws"] += 1
                 stats[b]["draws"] += 1
         elif sa > sb:
-            scores[a] += win_pt + gd_a * gd_bonus
+            scores[a] += win_pt * mult_a + gd_a * gd_bonus
             scores[b] += gd_b * gd_bonus
             stats[a]["wins"]   += 1
             stats[b]["losses"] += 1
         elif sa < sb:
-            scores[b] += win_pt + gd_b * gd_bonus
+            scores[b] += win_pt * mult_b + gd_b * gd_bonus
             scores[a] += gd_a * gd_bonus
             stats[b]["wins"]   += 1
             stats[a]["losses"] += 1
