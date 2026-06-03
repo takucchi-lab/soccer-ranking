@@ -1,174 +1,149 @@
 """
-サッカーゲーム Eloランキングアプリ
+サッカーゲーム ポイントランキングアプリ
 =================================
-14人でサッカーゲームの試合結果からEloレートを計算し、ランキングとレート変動を表示します。
+フェーズ（ラウンド）ごとの勝敗＋得失点差でポイントを計算します。
 
-使い方:
-    streamlit run app.py
+入力CSV の形式:
+    date,round,player_a,score_a,player_b,score_b,pk,pk_winner
+    2025-06-01,1回戦,Taro,3,Jiro,1,0,
+    2025-06-01,準決勝,Saburo,1,Shiro,1,1,Saburo
 
-入力CSV (例: matches.csv) の形式:
-    date,player_a,score_a,player_b,score_b
-    2025-06-01,Taro,3,Jiro,1
-    2025-06-01,Saburo,2,Shiro,2
-    ...
+    round: 1回戦 / 2回戦 / 準決勝 / 決勝  （設定画面で自由に追加可）
+    pk:    PK戦あり=1, なし=0
+    pk_winner: PK勝者の選手名（pk=0なら空欄）
 
 選手アイコン:
-    icons/ フォルダに「選手名.png」(または .jpg) を置くと自動で表示されます。
-    例: icons/Taro.png
+    icons/ フォルダに「選手名.png」(.jpg/.jpeg/.webp も可) を置くと表示されます。
 """
 
 import io
 import os
-from datetime import datetime
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-# ─────────────────────────────────────────────
-# 設定
-# ─────────────────────────────────────────────
-INITIAL_RATING = 1500      # 初期レート
-K_FACTOR = 20              # K係数（変動の大きさ。大きいほど1試合の変動が大きい）
-ICON_DIR = "icons"         # アイコン画像フォルダ
-DEFAULT_CSV = "matches.csv"  # デフォルト読み込みCSV
+# ──────────────────────────────────────────────
+# デフォルト設定
+# ──────────────────────────────────────────────
+INITIAL_SCORE   = 1000   # 全員の初期ポイント
+ICON_DIR        = "icons"
+DEFAULT_CSV     = "matches.csv"
 
-st.set_page_config(page_title="⚽ Soccer Elo Ranking", page_icon="⚽", layout="wide")
+DEFAULT_ROUNDS = {
+    "1回戦":  {"win": 10, "pk_win":  6, "gd_bonus": 2},
+    "2回戦":  {"win": 20, "pk_win": 12, "gd_bonus": 4},
+    "準決勝": {"win": 40, "pk_win": 24, "gd_bonus": 8},
+    "決勝":   {"win": 80, "pk_win": 48, "gd_bonus": 16},
+}
 
-
-# ─────────────────────────────────────────────
-# Elo計算ロジック
-# ─────────────────────────────────────────────
-def expected_score(rating_a: float, rating_b: float) -> float:
-    """AがBに勝つ期待値（0〜1）"""
-    return 1.0 / (1.0 + 10 ** ((rating_b - rating_a) / 400))
+st.set_page_config(page_title="⚽ Soccer Ranking", page_icon="⚽", layout="wide")
 
 
-def match_result(score_a: int, score_b: int) -> float:
-    """試合結果をAの得点(1.0=勝ち, 0.5=引き分け, 0.0=負け)に変換"""
-    if score_a > score_b:
-        return 1.0
-    if score_a < score_b:
-        return 0.0
-    return 0.5
-
-
-def goal_diff_multiplier(score_a: int, score_b: int) -> float:
-    """得点差によるK係数の補正。大差の試合ほどレート変動を大きくする"""
-    diff = abs(score_a - score_b)
-    if diff <= 1:
-        return 1.0
-    elif diff == 2:
-        return 1.5
-    else:
-        return (11 + diff) / 8.0  # 公式戦でよく使われる補正式
-
-
-def compute_elo(matches: pd.DataFrame):
-    """
-    試合履歴からEloレートを計算する。
-    返り値:
-      ratings: {選手名: 最終レート}
-      history: レート変動履歴のDataFrame (試合ごとの各選手レート)
-      stats:   {選手名: {games, wins, draws, losses, gf, ga}}
-    """
-    ratings = {}
-    stats = {}
+# ──────────────────────────────────────────────
+# ポイント計算ロジック
+# ──────────────────────────────────────────────
+def compute_points(matches: pd.DataFrame, round_config: dict):
+    scores = {}   # {選手名: 累計ポイント}
+    stats  = {}   # {選手名: {games, wins, pk_wins, draws, losses, gf, ga}}
     history_rows = []
 
-    def ensure_player(name):
-        if name not in ratings:
-            ratings[name] = INITIAL_RATING
-            stats[name] = dict(games=0, wins=0, draws=0, losses=0, gf=0, ga=0)
+    def ensure(name):
+        if name not in scores:
+            scores[name] = INITIAL_SCORE
+            stats[name]  = dict(games=0, wins=0, pk_wins=0, draws=0, losses=0, gf=0, ga=0)
 
-    # 日付順に処理
     matches = matches.sort_values("date").reset_index(drop=True)
 
     for idx, row in matches.iterrows():
-        a, b = str(row["player_a"]), str(row["player_b"])
-        sa, sb = int(row["score_a"]), int(row["score_b"])
+        a     = str(row["player_a"])
+        b     = str(row["player_b"])
+        sa    = int(row["score_a"])
+        sb    = int(row["score_b"])
+        round_name = str(row["round"]).strip()
         is_pk = bool(int(row["pk"])) if "pk" in matches.columns and str(row.get("pk","")).strip() not in ("","nan") else False
-        ensure_player(a)
-        ensure_player(b)
+        pk_winner  = str(row.get("pk_winner","")).strip() if "pk_winner" in matches.columns else ""
 
-        ra, rb = ratings[a], ratings[b]
-        ea = expected_score(ra, rb)
-        eb = 1.0 - ea
+        ensure(a); ensure(b)
 
-        # PK戦は「引き分け」としてElo計算（変動を小さく抑える）
+        cfg = round_config.get(round_name, {"win": 10, "pk_win": 6, "gd_bonus": 2})
+        win_pt    = cfg["win"]
+        pk_win_pt = cfg["pk_win"]
+        gd_bonus  = cfg["gd_bonus"]
+
+        # 得失点差（本戦のみ）
+        gd_a = sa - sb   # Aから見た得失点差
+        gd_b = sb - sa
+
+        # ポイント計算
         if is_pk:
-            result_a = 0.5
-            k = K_FACTOR
-        else:
-            result_a = match_result(sa, sb)
-            k = K_FACTOR * goal_diff_multiplier(sa, sb)
-        result_b = 1.0 - result_a
-
-        ratings[a] = ra + k * (result_a - ea)
-        ratings[b] = rb + k * (result_b - eb)
-
-        # 戦績更新
-        for name, gf, ga in ((a, sa, sb), (b, sb, sa)):
-            stats[name]["games"] += 1
-            stats[name]["gf"] += gf
-            stats[name]["ga"] += ga
-        if is_pk:
-            # PK戦：pk_winner列で勝者を判定
-            pk_winner = str(row.get("pk_winner", "")).strip() if "pk_winner" in matches.columns else ""
+            # PK戦：本戦は引き分け扱い → 得失点差のみ両者に加算
+            # 勝者にpk_win_pt追加
+            scores[a] += gd_a * gd_bonus
+            scores[b] += gd_b * gd_bonus
             if pk_winner == a:
-                stats[a]["wins"] += 1
-                stats[b]["losses"] += 1
+                scores[a] += pk_win_pt
+                stats[a]["wins"]    += 1
+                stats[a]["pk_wins"] += 1
+                stats[b]["losses"]  += 1
             elif pk_winner == b:
-                stats[b]["wins"] += 1
-                stats[a]["losses"] += 1
+                scores[b] += pk_win_pt
+                stats[b]["wins"]    += 1
+                stats[b]["pk_wins"] += 1
+                stats[a]["losses"]  += 1
             else:
-                # pk_winnerが空欄や不明の場合は引き分け扱い
                 stats[a]["draws"] += 1
                 stats[b]["draws"] += 1
         elif sa > sb:
-            stats[a]["wins"] += 1
+            scores[a] += win_pt + gd_a * gd_bonus
+            scores[b] += gd_b * gd_bonus          # 敗者は得失点差のみ（マイナスあり）
+            stats[a]["wins"]   += 1
             stats[b]["losses"] += 1
         elif sa < sb:
-            stats[b]["wins"] += 1
+            scores[b] += win_pt + gd_b * gd_bonus
+            scores[a] += gd_a * gd_bonus
+            stats[b]["wins"]   += 1
             stats[a]["losses"] += 1
         else:
+            scores[a] += gd_a * gd_bonus  # 引き分け＆同点なら0
+            scores[b] += gd_b * gd_bonus
             stats[a]["draws"] += 1
             stats[b]["draws"] += 1
 
-        # 履歴に全選手の現レートを記録
-        snapshot = {"match_no": idx + 1, "date": row["date"]}
-        snapshot.update({p: round(r, 1) for p, r in ratings.items()})
-        history_rows.append(snapshot)
+        for name, gf, ga in ((a, sa, sb), (b, sb, sa)):
+            stats[name]["games"] += 1
+            stats[name]["gf"]    += gf
+            stats[name]["ga"]    += ga
 
-    history = pd.DataFrame(history_rows)
-    return ratings, history, stats
+        snap = {"match_no": idx + 1, "date": str(row["date"]), "round": round_name}
+        snap.update({p: round(s, 1) for p, s in scores.items()})
+        history_rows.append(snap)
+
+    return scores, pd.DataFrame(history_rows), stats
 
 
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────
 # アイコン取得
-# ─────────────────────────────────────────────
-def find_icon(player_name: str):
-    """icons/フォルダから選手のアイコンパスを探す。なければNone"""
+# ──────────────────────────────────────────────
+def find_icon(name):
     if not os.path.isdir(ICON_DIR):
         return None
     for ext in (".png", ".jpg", ".jpeg", ".webp"):
-        path = os.path.join(ICON_DIR, f"{player_name}{ext}")
+        path = os.path.join(ICON_DIR, f"{name}{ext}")
         if os.path.exists(path):
             return path
     return None
 
 
-# ─────────────────────────────────────────────
-# データ読み込み
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────
+# CSV読み込み
+# ──────────────────────────────────────────────
 def load_matches():
-    """CSVアップロード or デフォルトファイルから試合データを読み込む"""
     st.sidebar.header("📂 データ入力")
     uploaded = st.sidebar.file_uploader(
         "試合結果CSVをアップロード", type=["csv"],
-        help="列: date, player_a, score_a, player_b, score_b"
+        help="列: date, round, player_a, score_a, player_b, score_b, pk, pk_winner"
     )
-
     if uploaded is not None:
         raw = uploaded.read()
         for enc in ("utf-8-sig", "utf-8", "cp932", "shift-jis"):
@@ -178,7 +153,7 @@ def load_matches():
             except Exception:
                 continue
         else:
-            st.error("CSVの文字コードを判定できませんでした。UTF-8で保存し直してください。")
+            st.error("文字コードを判定できませんでした。UTF-8で保存し直してください。")
             return None
     elif os.path.exists(DEFAULT_CSV):
         df = pd.read_csv(DEFAULT_CSV, encoding="utf-8-sig")
@@ -187,36 +162,51 @@ def load_matches():
         st.sidebar.warning("CSVをアップロードしてください")
         return None
 
-    # 列名チェック
-    required = {"date", "player_a", "score_a", "player_b", "score_b"}
+    required = {"date", "round", "player_a", "score_a", "player_b", "score_b"}
     if not required.issubset(df.columns):
-        st.error(f"CSVに必要な列がありません。必要な列: {required}")
-        st.write("読み込んだ列:", list(df.columns))
+        st.error(f"CSVに必要な列がありません。必要: {required}\n実際: {list(df.columns)}")
         return None
-
     return df
 
 
-# ─────────────────────────────────────────────
-# 表示: スコア一覧タブ
-# ─────────────────────────────────────────────
-def render_standings(ratings, stats):
+# ──────────────────────────────────────────────
+# サイドバー：配点設定
+# ──────────────────────────────────────────────
+def build_round_config(matches):
+    st.sidebar.markdown("---")
+    st.sidebar.header("⚙️ 配点設定")
+
+    # CSVに登場するラウンド名を自動検出 → デフォルト設定とマージ
+    csv_rounds = list(matches["round"].unique()) if matches is not None else []
+    all_rounds = list(DEFAULT_ROUNDS.keys())
+    for r in csv_rounds:
+        if r not in all_rounds:
+            all_rounds.append(r)
+
+    config = {}
+    for rname in all_rounds:
+        default = DEFAULT_ROUNDS.get(rname, {"win": 10, "pk_win": 6, "gd_bonus": 2})
+        with st.sidebar.expander(f"📋 {rname}"):
+            w  = st.number_input("通常勝ち (pt)",   value=default["win"],      key=f"{rname}_win",  step=1)
+            p  = st.number_input("PK勝ち (pt)",     value=default["pk_win"],   key=f"{rname}_pk",   step=1)
+            g  = st.number_input("得失点差ボーナス (pt/点)", value=default["gd_bonus"], key=f"{rname}_gd",   step=1)
+        config[rname] = {"win": w, "pk_win": p, "gd_bonus": g}
+    return config
+
+
+# ──────────────────────────────────────────────
+# タブ1：ランキング
+# ──────────────────────────────────────────────
+def render_standings(scores, stats):
     st.subheader("🏆 ランキング")
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
-    # ランキング順にソート
-    ranked = sorted(ratings.items(), key=lambda x: x[1], reverse=True)
-
-    for rank, (name, rating) in enumerate(ranked, start=1):
+    for rank, (name, score) in enumerate(ranked, 1):
         s = stats[name]
-        col_rank, col_icon, col_name, col_rating, col_record = st.columns(
-            [0.6, 0.8, 2, 1.2, 2]
-        )
-
-        # メダル表示
+        col_rank, col_icon, col_name, col_score, col_record = st.columns([0.6, 0.8, 2, 1.5, 2.5])
         medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(rank, f"{rank}")
         col_rank.markdown(f"### {medal}")
 
-        # アイコン
         icon = find_icon(name)
         if icon:
             col_icon.image(icon, width=50)
@@ -224,112 +214,90 @@ def render_standings(ratings, stats):
             col_icon.markdown("### 👤")
 
         col_name.markdown(f"### {name}")
-        col_rating.metric("レート", f"{rating:.0f}")
+        delta = score - INITIAL_SCORE
+        col_score.metric("ポイント", f"{score:.0f}", delta=f"{delta:+.0f}")
+
+        pk_str = f"（うちPK {s['pk_wins']}）" if s["pk_wins"] > 0 else ""
         col_record.markdown(
-            f"**{s['wins']}**勝 **{s['draws']}**分 **{s['losses']}**敗  \n"
-            f"得点 {s['gf']} / 失点 {s['ga']} "
-            f"(差 {s['gf'] - s['ga']:+d})"
+            f"**{s['wins']}**勝{pk_str} **{s['draws']}**分 **{s['losses']}**敗  \n"
+            f"得点 {s['gf']} / 失点 {s['ga']}　得失差 {s['gf']-s['ga']:+d}"
         )
         st.divider()
 
-    # 表形式でもダウンロード可能に
     table = pd.DataFrame([
-        {
-            "順位": i,
-            "選手": name,
-            "レート": round(rating, 1),
-            "試合": stats[name]["games"],
-            "勝": stats[name]["wins"],
-            "分": stats[name]["draws"],
-            "敗": stats[name]["losses"],
-            "得点": stats[name]["gf"],
-            "失点": stats[name]["ga"],
-            "得失差": stats[name]["gf"] - stats[name]["ga"],
-        }
-        for i, (name, rating) in enumerate(ranked, start=1)
+        {"順位": i, "選手": n, "ポイント": round(s, 1),
+         "初期値との差": round(s - INITIAL_SCORE, 1),
+         "試合": stats[n]["games"], "勝": stats[n]["wins"],
+         "PKでの勝ち": stats[n]["pk_wins"],
+         "分": stats[n]["draws"], "敗": stats[n]["losses"],
+         "得点": stats[n]["gf"], "失点": stats[n]["ga"],
+         "得失差": stats[n]["gf"] - stats[n]["ga"]}
+        for i, (n, s) in enumerate(ranked, 1)
     ])
     st.download_button(
         "📥 ランキングをCSVでダウンロード",
         table.to_csv(index=False).encode("utf-8-sig"),
-        file_name="ranking.csv",
-        mime="text/csv",
+        file_name="ranking.csv", mime="text/csv",
     )
 
 
-# ─────────────────────────────────────────────
-# 表示: レート変動グラフタブ
-# ─────────────────────────────────────────────
-def render_chart(history, ratings):
-    st.subheader("📈 レート変動")
-
-    players = [c for c in history.columns if c not in ("match_no", "date")]
-
-    # 表示する選手を選べるように
-    selected = st.multiselect(
-        "表示する選手を選択（未選択なら全員）",
-        options=sorted(players),
-        default=[],
-    )
+# ──────────────────────────────────────────────
+# タブ2：ポイント変動グラフ
+# ──────────────────────────────────────────────
+def render_chart(history, scores):
+    st.subheader("📈 ポイント変動")
+    players = [c for c in history.columns if c not in ("match_no", "date", "round")]
+    selected = st.multiselect("表示する選手（未選択なら全員）", sorted(players), default=[])
     show = selected if selected else players
+    ordered = sorted(show, key=lambda p: scores.get(p, 0), reverse=True)
 
     fig = go.Figure()
-    # 最終レート順で凡例を並べる
-    ordered = sorted(show, key=lambda p: ratings.get(p, 0), reverse=True)
     for name in ordered:
-        # その選手が登場するまではNaN（線を引かない）
-        y = history[name]
         fig.add_trace(go.Scatter(
-            x=history["match_no"],
-            y=y,
+            x=history["match_no"], y=history[name],
             mode="lines+markers",
-            name=f"{name} ({ratings[name]:.0f})",
-            connectgaps=False,
-            marker=dict(size=4),
+            name=f"{name} ({scores[name]:.0f}pt)",
+            connectgaps=False, marker=dict(size=5),
         ))
-
+    fig.add_hline(y=INITIAL_SCORE, line_dash="dot", line_color="gray",
+                  annotation_text=f"初期値 {INITIAL_SCORE}pt")
     fig.update_layout(
-        xaxis_title="試合番号",
-        yaxis_title="レート",
-        hovermode="x unified",
-        height=600,
-        legend=dict(orientation="v", yanchor="top", y=1, xanchor="left", x=1.02),
+        xaxis_title="試合番号", yaxis_title="ポイント",
+        hovermode="x unified", height=600,
     )
-    fig.add_hline(y=INITIAL_RATING, line_dash="dot", line_color="gray",
-                  annotation_text=f"初期値 {INITIAL_RATING}")
     st.plotly_chart(fig, use_container_width=True)
 
 
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────
 # メイン
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────
 def main():
-    st.title("eFootball Ranking")
-    st.caption("試合結果からレートを計算してランキング化します")
+    st.title("⚽ Soccer Game Ranking")
+    st.caption("ラウンド×勝敗×得失点差でポイントを計算します")
 
     matches = load_matches()
+    round_config = build_round_config(matches)
+
     if matches is None:
         st.info(
-            "👈 サイドバーから試合結果のCSVをアップロードしてください。\n\n"
+            "👈 サイドバーからCSVをアップロードしてください。\n\n"
             "**CSV形式の例:**\n```\n"
-            "date,player_a,score_a,player_b,score_b\n"
-            "2025-06-01,Taro,3,Jiro,1\n"
-            "2025-06-01,Saburo,2,Shiro,2\n```"
+            "date,round,player_a,score_a,player_b,score_b,pk,pk_winner\n"
+            "2025-06-01,1回戦,Taro,3,Jiro,1,0,\n"
+            "2025-06-01,準決勝,Saburo,1,Shiro,1,1,Saburo\n```"
         )
         return
 
-    ratings, history, stats = compute_elo(matches)
+    scores, history, stats = compute_points(matches, round_config)
 
-    tab1, tab2, tab3 = st.tabs(["🏆 スコア一覧", "📈 レート変動", "📋 試合履歴"])
+    tab1, tab2, tab3 = st.tabs(["🏆 ランキング", "📈 ポイント変動", "📋 試合履歴"])
     with tab1:
-        render_standings(ratings, stats)
+        render_standings(scores, stats)
     with tab2:
-        render_chart(history, ratings)
+        render_chart(history, scores)
     with tab3:
         st.subheader("📋 試合履歴")
-        st.dataframe(
-            matches.sort_values("date").reset_index(drop=True),
-            use_container_width=True,
-        )
+        st.dataframe(matches.sort_values("date").reset_index(drop=True), use_container_width=True)
 
 
 if __name__ == "__main__":
