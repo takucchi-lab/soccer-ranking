@@ -1,23 +1,17 @@
 """
 サッカーゲーム ポイントランキングアプリ
 =================================
-フェーズ（ラウンド）ごとの勝敗＋得失点差でポイントを計算します。
-
 入力CSV の形式:
-    date,round,player_a,score_a,player_b,score_b,pk,pk_winner
-    2025-06-01,1回戦,Taro,3,Jiro,1,0,
-    2025-06-01,準決勝,Saburo,1,Shiro,1,1,Saburo
-
-    round:      1回戦 / 2回戦 / 準決勝 / 決勝  （設定画面で自由に追加可）
-    pk:         PK戦あり=1, なし=0
-    pk_winner:  PK勝者の選手名（pk=0なら空欄）
-
-シード選手:
-    サイドバーの「シード選手」欄に名前を入力（カンマ区切りで複数可）。
-    1回戦終了後に1回戦参加者の平均獲得ポイントが自動付与されます。
+    date,tournament,round,player_a,score_a,player_b,score_b,pk,pk_winner
+    2025-06-01,第1回,1回戦,Taro,3,Jiro,1,0,
+    2025-06-15,第2回,1回戦,Saburo,1,Shiro,1,1,Saburo
 
 選手アイコン:
-    icons/ フォルダに「選手名.png」(.jpg/.jpeg/.webp も可) を置くと表示されます。
+    icons/ フォルダに「選手名.png」(.jpg/.jpeg/.webp) を置くと表示されます。
+
+パスワード設定 (.streamlit/secrets.toml):
+    ADMIN_PASSWORD = "yourpassword"
+    GITHUB_CSV_URL = "https://raw.githubusercontent.com/yourname/soccer-ranking/main/matches.csv"
 """
 
 import io
@@ -25,14 +19,14 @@ import os
 
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 
 # ──────────────────────────────────────────────
-# デフォルト設定
+# 設定
 # ──────────────────────────────────────────────
-INITIAL_SCORE   = 1000   # 全員の初期ポイント
-ICON_DIR        = "icons"
-DEFAULT_CSV     = "matches.csv"
+INITIAL_SCORE = 1000
+ICON_DIR      = "icons"
 
 DEFAULT_ROUNDS = {
     "1回戦":  {"win": 10, "pk_win":  7, "gd_bonus": 1},
@@ -45,32 +39,114 @@ st.set_page_config(page_title="⚽ Soccer Ranking", page_icon="⚽", layout="wid
 
 
 # ──────────────────────────────────────────────
+# 管理者チェック
+# ──────────────────────────────────────────────
+def is_admin() -> bool:
+    return st.session_state.get("authenticated", False)
+
+
+def admin_login_widget():
+    """サイドバーにパスワード入力欄を表示。認証済みなら管理者バッジを表示。"""
+    if is_admin():
+        st.sidebar.success("🔑 管理者モード")
+        if st.sidebar.button("ログアウト"):
+            st.session_state["authenticated"] = False
+            st.rerun()
+        return
+
+    with st.sidebar.expander("🔒 管理者ログイン"):
+        pw = st.text_input("パスワード", type="password", key="pw_input")
+        if st.button("ログイン"):
+            correct = st.secrets.get("ADMIN_PASSWORD", "admin")
+            if pw == correct:
+                st.session_state["authenticated"] = True
+                st.rerun()
+            else:
+                st.error("パスワードが違います")
+
+
+# ──────────────────────────────────────────────
+# CSV読み込み
+# ──────────────────────────────────────────────
+def read_csv_bytes(raw: bytes) -> pd.DataFrame | None:
+    for enc in ("utf-8-sig", "utf-8", "cp932", "shift-jis"):
+        try:
+            return pd.read_csv(io.BytesIO(raw), encoding=enc)
+        except Exception:
+            continue
+    return None
+
+
+def load_matches() -> pd.DataFrame | None:
+    st.sidebar.markdown("---")
+    st.sidebar.header("📂 データ")
+
+    df = None
+
+    if is_admin():
+        # 管理者：アップロードUI表示
+        uploaded = st.sidebar.file_uploader(
+            "CSVをアップロード", type=["csv"],
+            help="date,tournament,round,player_a,score_a,player_b,score_b,pk,pk_winner"
+        )
+        if uploaded:
+            df = read_csv_bytes(uploaded.read())
+            if df is None:
+                st.error("文字コードを判定できませんでした。UTF-8で保存し直してください。")
+                return None
+            st.sidebar.success("アップロードしたCSVを表示中")
+    
+    # 管理者でアップロードなし、または一般ユーザー → GitHubから自動取得
+    if df is None:
+        github_url = st.secrets.get(
+            "GITHUB_CSV_URL",
+            "https://raw.githubusercontent.com/yourname/soccer-ranking/main/matches.csv"
+        )
+        try:
+            resp = requests.get(github_url, timeout=10)
+            resp.raise_for_status()
+            df = read_csv_bytes(resp.content)
+            if df is None:
+                st.error("GitHubのCSVを読み込めませんでした。")
+                return None
+            st.sidebar.info("📡 GitHubから最新データを読み込みました")
+        except Exception as e:
+            st.error(f"GitHubからのCSV取得に失敗しました: {e}")
+            return None
+
+    required = {"date", "tournament", "round", "player_a", "score_a", "player_b", "score_b"}
+    if not required.issubset(df.columns):
+        st.error(f"必要な列が不足しています。\n必要: {required}\n実際: {list(df.columns)}")
+        return None
+    return df
+
+
+# ──────────────────────────────────────────────
 # ポイント計算ロジック
 # ──────────────────────────────────────────────
 def opponent_multiplier(my_score: float, opp_score: float) -> float:
-    """相手レートに基づく補正係数（±20%以内）
-    強い相手に勝つほど係数>1、弱い相手には<1"""
-    diff = opp_score - my_score   # 正=相手が格上
-    return 1.0 + 0.2 * diff / 1000.0
+    """相手レートによる補正係数（±20%以内）"""
+    return 1.0 + 0.2 * (opp_score - my_score) / 1000.0
 
 
-def compute_points(matches: pd.DataFrame, round_config: dict, seed_players: list):
-    scores = {}   # {選手名: 累計ポイント}
-    stats  = {}   # {選手名: {games, wins, pk_wins, draws, losses, gf, ga, seed, seed_bonus}}
+def compute_points(matches: pd.DataFrame, round_config: dict, seeds_by_tournament: dict):
+    """
+    seeds_by_tournament: {"第1回": ["Taro", "Jiro"], "第2回": ["Shiro"], ...}
+    """
+    scores       = {}
+    stats        = {}
     history_rows = []
-    seed_bonus_applied = False
-    SEED_ROUND = "1回戦"
 
     def ensure(name):
         if name not in scores:
             scores[name] = INITIAL_SCORE
             stats[name]  = dict(games=0, wins=0, pk_wins=0, draws=0, losses=0,
-                                gf=0, ga=0, seed=name in seed_players, seed_bonus=0)
+                                gf=0, ga=0, seed_bonus_total=0)
 
-    for p in seed_players:
-        ensure(p)
+    matches = matches.sort_values(["date", "tournament"]).reset_index(drop=True)
 
-    matches = matches.sort_values("date").reset_index(drop=True)
+    # 大会ごとにシードボーナスを付与したか追跡
+    seed_bonus_applied = {}   # {tournament_name: bool}
 
     for idx, row in matches.iterrows():
         a          = str(row["player_a"])
@@ -78,52 +154,55 @@ def compute_points(matches: pd.DataFrame, round_config: dict, seed_players: list
         sa         = int(row["score_a"])
         sb         = int(row["score_b"])
         round_name = str(row["round"]).strip()
+        tournament = str(row["tournament"]).strip()
         is_pk      = bool(int(row["pk"])) if "pk" in matches.columns and str(row.get("pk","")).strip() not in ("","nan") else False
         pk_winner  = str(row.get("pk_winner","")).strip() if "pk_winner" in matches.columns else ""
 
         ensure(a); ensure(b)
 
-        # 1回戦以外の試合が始まる直前にシードボーナスを付与（1回戦勝ち扱い）
-        if not seed_bonus_applied and round_name != SEED_ROUND and seed_players:
-            first_round = matches[matches["round"] == SEED_ROUND]
+        # この大会のシード選手
+        seed_players = seeds_by_tournament.get(tournament, [])
+
+        # シード選手を先に登録
+        for p in seed_players:
+            ensure(p)
+
+        # 1回戦以外が始まる直前にシードボーナス付与（大会ごと）
+        if tournament not in seed_bonus_applied and round_name != "1回戦" and seed_players:
+            first_round = matches[(matches["tournament"] == tournament) & (matches["round"] == "1回戦")]
             if len(first_round) > 0:
-                fr_players = set(
-                    first_round["player_a"].astype(str).tolist() +
-                    first_round["player_b"].astype(str).tolist()
-                )
-                # 1回戦勝者の獲得ポイント平均を計算
                 winners = []
-                for _, fr_row in first_round.iterrows():
-                    fa, fb = str(fr_row["player_a"]), str(fr_row["player_b"])
-                    fsa, fsb = int(fr_row["score_a"]), int(fr_row["score_b"])
-                    fpk = bool(int(fr_row["pk"])) if "pk" in first_round.columns and str(fr_row.get("pk","")).strip() not in ("","nan") else False
-                    fpk_w = str(fr_row.get("pk_winner","")).strip() if "pk_winner" in first_round.columns else ""
+                for _, fr in first_round.iterrows():
+                    fa, fb   = str(fr["player_a"]), str(fr["player_b"])
+                    fsa, fsb = int(fr["score_a"]), int(fr["score_b"])
+                    fpk      = bool(int(fr["pk"])) if "pk" in first_round.columns and str(fr.get("pk","")).strip() not in ("","nan") else False
+                    fpk_w    = str(fr.get("pk_winner","")).strip() if "pk_winner" in first_round.columns else ""
                     if fpk:
                         winners.append(fpk_w if fpk_w else fa)
                     elif fsa > fsb:
                         winners.append(fa)
                     elif fsb > fsa:
                         winners.append(fb)
-                winner_gains = [scores[p] - INITIAL_SCORE for p in winners if p in scores]
-                avg_gain = sum(winner_gains) / len(winner_gains) if winner_gains else 0
-                for p in seed_players:
-                    scores[p] += avg_gain
-                    stats[p]["seed_bonus"] = round(avg_gain, 1)
-                    stats[p]["wins"]  += 1   # 1回戦勝ち扱い
-                    stats[p]["games"] += 1
-            seed_bonus_applied = True
 
-        cfg       = round_config.get(round_name, {"win": 10, "pk_win": 6, "gd_bonus": 2})
+                gains    = [scores[p] - INITIAL_SCORE for p in winners if p in scores]
+                avg_gain = sum(gains) / len(gains) if gains else 0
+
+                for p in seed_players:
+                    scores[p]                    += avg_gain
+                    stats[p]["seed_bonus_total"] += round(avg_gain, 1)
+                    stats[p]["wins"]             += 1
+                    stats[p]["games"]            += 1
+
+            seed_bonus_applied[tournament] = True
+
+        cfg       = round_config.get(round_name, {"win": 10, "pk_win": 7, "gd_bonus": 1})
         win_pt    = cfg["win"]
         pk_win_pt = cfg["pk_win"]
         gd_bonus  = cfg["gd_bonus"]
-
-        gd_a = sa - sb
-        gd_b = sb - sa
-
-        # 相手レート補正（勝利ポイント・PK勝利ポイントのみ適用）
-        mult_a = opponent_multiplier(scores[a], scores[b])
-        mult_b = opponent_multiplier(scores[b], scores[a])
+        gd_a      = sa - sb
+        gd_b      = sb - sa
+        mult_a    = opponent_multiplier(scores[a], scores[b])
+        mult_b    = opponent_multiplier(scores[b], scores[a])
 
         if is_pk:
             scores[a] += gd_a * gd_bonus
@@ -162,12 +241,12 @@ def compute_points(matches: pd.DataFrame, round_config: dict, seed_players: list
             stats[name]["gf"]    += gf
             stats[name]["ga"]    += ga
 
-        snap = {"match_no": idx + 1, "date": str(row["date"]), "round": round_name}
+        snap = {"match_no": idx + 1, "date": str(row["date"]),
+                "tournament": tournament, "round": round_name}
         snap.update({p: round(s, 1) for p, s in scores.items()})
         history_rows.append(snap)
 
     return scores, pd.DataFrame(history_rows), stats
-
 
 
 # ──────────────────────────────────────────────
@@ -184,60 +263,35 @@ def find_icon(name):
 
 
 # ──────────────────────────────────────────────
-# CSV読み込み
+# サイドバー：シード・配点（管理者のみ）
 # ──────────────────────────────────────────────
-def load_matches():
-    st.sidebar.header("📂 データ入力")
-    uploaded = st.sidebar.file_uploader(
-        "試合結果CSVをアップロード", type=["csv"],
-        help="列: date, round, player_a, score_a, player_b, score_b, pk, pk_winner"
-    )
-    if uploaded is not None:
-        raw = uploaded.read()
-        for enc in ("utf-8-sig", "utf-8", "cp932", "shift-jis"):
-            try:
-                df = pd.read_csv(io.BytesIO(raw), encoding=enc)
-                break
-            except Exception:
-                continue
-        else:
-            st.error("文字コードを判定できませんでした。UTF-8で保存し直してください。")
-            return None
-    elif os.path.exists(DEFAULT_CSV):
-        df = pd.read_csv(DEFAULT_CSV, encoding="utf-8-sig")
-        st.sidebar.info(f"`{DEFAULT_CSV}` を読み込みました")
-    else:
-        st.sidebar.warning("CSVをアップロードしてください")
-        return None
-
-    required = {"date", "round", "player_a", "score_a", "player_b", "score_b"}
-    if not required.issubset(df.columns):
-        st.error(f"CSVに必要な列がありません。必要: {required}\n実際: {list(df.columns)}")
-        return None
-    return df
-
-
-# ──────────────────────────────────────────────
-# サイドバー：配点設定
-# ──────────────────────────────────────────────
-def build_seed_players():
+def build_seeds_by_tournament(matches: pd.DataFrame) -> dict:
     st.sidebar.markdown("---")
-    st.sidebar.header("🌟 シード選手")
-    seed_input = st.sidebar.text_input(
-        "シード選手名（カンマ区切り）",
-        help="1回戦をスキップする選手。複数いる場合はカンマで区切ってください。例: Taro, Jiro"
-    )
-    seeds = [s.strip() for s in seed_input.split(",") if s.strip()] if seed_input else []
-    if seeds:
-        st.sidebar.info(f"シード: {', '.join(seeds)}")
+    st.sidebar.header("🌟 シード選手設定")
+
+    tournaments = sorted(matches["tournament"].unique()) if matches is not None else []
+    seeds = {}
+
+    if not is_admin():
+        st.sidebar.caption("（管理者のみ変更可）")
+        # 一般ユーザーには空dict返す（シードなし扱い）
+        return seeds
+
+    for t in tournaments:
+        raw = st.sidebar.text_input(
+            f"{t} のシード選手",
+            key=f"seed_{t}",
+            help="カンマ区切りで複数可。例: Taro, Jiro"
+        )
+        seeds[t] = [s.strip() for s in raw.split(",") if s.strip()] if raw else []
+
     return seeds
 
 
-def build_round_config(matches):
+def build_round_config(matches: pd.DataFrame) -> dict:
     st.sidebar.markdown("---")
     st.sidebar.header("⚙️ 配点設定")
 
-    # CSVに登場するラウンド名を自動検出 → デフォルト設定とマージ
     csv_rounds = list(matches["round"].unique()) if matches is not None else []
     all_rounds = list(DEFAULT_ROUNDS.keys())
     for r in csv_rounds:
@@ -246,12 +300,19 @@ def build_round_config(matches):
 
     config = {}
     for rname in all_rounds:
-        default = DEFAULT_ROUNDS.get(rname, {"win": 10, "pk_win": 6, "gd_bonus": 2})
-        with st.sidebar.expander(f"📋 {rname}"):
-            w  = st.number_input("通常勝ち (pt)",   value=default["win"],      key=f"{rname}_win",  step=1)
-            p  = st.number_input("PK勝ち (pt)",     value=default["pk_win"],   key=f"{rname}_pk",   step=1)
-            g  = st.number_input("得失点差ボーナス (pt/点)", value=default["gd_bonus"], key=f"{rname}_gd",   step=1)
-        config[rname] = {"win": w, "pk_win": p, "gd_bonus": g}
+        default = DEFAULT_ROUNDS.get(rname, {"win": 10, "pk_win": 7, "gd_bonus": 1})
+        if is_admin():
+            with st.sidebar.expander(f"📋 {rname}"):
+                w = st.number_input("通常勝ち (pt)",          value=default["win"],      key=f"{rname}_win", step=1)
+                p = st.number_input("PK勝ち (pt)",            value=default["pk_win"],   key=f"{rname}_pk",  step=1)
+                g = st.number_input("得失点差ボーナス (pt/点)", value=default["gd_bonus"], key=f"{rname}_gd",  step=1)
+            config[rname] = {"win": w, "pk_win": p, "gd_bonus": g}
+        else:
+            config[rname] = default
+
+    if not is_admin():
+        st.sidebar.caption("（管理者のみ変更可）")
+
     return config
 
 
@@ -269,17 +330,14 @@ def render_standings(scores, stats):
         col_rank.markdown(f"### {medal}")
 
         icon = find_icon(name)
-        if icon:
-            col_icon.image(icon, width=50)
-        else:
-            col_icon.markdown("### 👤")
+        col_icon.image(icon, width=50) if icon else col_icon.markdown("### 👤")
 
         col_name.markdown(f"### {name}")
         delta = score - INITIAL_SCORE
         col_score.metric("ポイント", f"{score:.0f}", delta=f"{delta:+.0f}")
 
         pk_str   = f"（うちPK {s['pk_wins']}）" if s["pk_wins"] > 0 else ""
-        seed_str = f"　🌟シード（ボーナス {s['seed_bonus']:+.1f}pt）" if s.get("seed") else ""
+        seed_str = f"　🌟累計ボーナス {s['seed_bonus_total']:+.1f}pt" if s["seed_bonus_total"] != 0 else ""
         col_record.markdown(
             f"**{s['wins']}**勝{pk_str} **{s['draws']}**分 **{s['losses']}**敗  \n"
             f"得点 {s['gf']} / 失点 {s['ga']}　得失差 {s['gf']-s['ga']:+d}{seed_str}"
@@ -290,14 +348,14 @@ def render_standings(scores, stats):
         {"順位": i, "選手": n, "ポイント": round(s, 1),
          "初期値との差": round(s - INITIAL_SCORE, 1),
          "試合": stats[n]["games"], "勝": stats[n]["wins"],
-         "PKでの勝ち": stats[n]["pk_wins"],
-         "分": stats[n]["draws"], "敗": stats[n]["losses"],
+         "PKでの勝ち": stats[n]["pk_wins"], "分": stats[n]["draws"], "敗": stats[n]["losses"],
          "得点": stats[n]["gf"], "失点": stats[n]["ga"],
-         "得失差": stats[n]["gf"] - stats[n]["ga"]}
+         "得失差": stats[n]["gf"] - stats[n]["ga"],
+         "シードボーナス計": stats[n]["seed_bonus_total"]}
         for i, (n, s) in enumerate(ranked, 1)
     ])
     st.download_button(
-        "📥 ランキングをCSVでダウンロード",
+        "📥 ランキングCSVダウンロード",
         table.to_csv(index=False).encode("utf-8-sig"),
         file_name="ranking.csv", mime="text/csv",
     )
@@ -308,10 +366,10 @@ def render_standings(scores, stats):
 # ──────────────────────────────────────────────
 def render_chart(history, scores):
     st.subheader("📈 ポイント変動")
-    players = [c for c in history.columns if c not in ("match_no", "date", "round")]
+    players  = [c for c in history.columns if c not in ("match_no", "date", "tournament", "round")]
     selected = st.multiselect("表示する選手（未選択なら全員）", sorted(players), default=[])
-    show = selected if selected else players
-    ordered = sorted(show, key=lambda p: scores.get(p, 0), reverse=True)
+    show     = selected if selected else players
+    ordered  = sorted(show, key=lambda p: scores.get(p, 0), reverse=True)
 
     fig = go.Figure()
     for name in ordered:
@@ -337,21 +395,22 @@ def main():
     st.title("⚽ Soccer Game Ranking")
     st.caption("ラウンド×勝敗×得失点差でポイントを計算します")
 
-    matches = load_matches()
-    seed_players = build_seed_players()
-    round_config = build_round_config(matches)
+    admin_login_widget()
+    matches      = load_matches()
+    seeds        = build_seeds_by_tournament(matches if matches is not None else pd.DataFrame(columns=["tournament"]))
+    round_config = build_round_config(matches if matches is not None else pd.DataFrame(columns=["round"]))
 
     if matches is None:
         st.info(
-            "👈 サイドバーからCSVをアップロードしてください。\n\n"
+            "データを読み込めませんでした。\n\n"
             "**CSV形式の例:**\n```\n"
-            "date,round,player_a,score_a,player_b,score_b,pk,pk_winner\n"
-            "2025-06-01,1回戦,Taro,3,Jiro,1,0,\n"
-            "2025-06-01,準決勝,Saburo,1,Shiro,1,1,Saburo\n```"
+            "date,tournament,round,player_a,score_a,player_b,score_b,pk,pk_winner\n"
+            "2025-06-01,第1回,1回戦,Taro,3,Jiro,1,0,\n"
+            "2025-06-15,第2回,準決勝,Saburo,1,Shiro,1,1,Saburo\n```"
         )
         return
 
-    scores, history, stats = compute_points(matches, round_config, seed_players)
+    scores, history, stats = compute_points(matches, round_config, seeds)
 
     tab1, tab2, tab3 = st.tabs(["🏆 ランキング", "📈 ポイント変動", "📋 試合履歴"])
     with tab1:
@@ -360,7 +419,8 @@ def main():
         render_chart(history, scores)
     with tab3:
         st.subheader("📋 試合履歴")
-        st.dataframe(matches.sort_values("date").reset_index(drop=True), use_container_width=True)
+        st.dataframe(matches.sort_values(["date","tournament"]).reset_index(drop=True),
+                     use_container_width=True)
 
 
 if __name__ == "__main__":
