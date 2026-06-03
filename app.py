@@ -2,9 +2,12 @@
 サッカーゲーム ポイントランキングアプリ
 =================================
 入力CSV の形式:
-    date,tournament,round,player_a,score_a,player_b,score_b,pk,pk_winner
-    2025-06-01,第1回,1回戦,Taro,3,Jiro,1,0,
-    2025-06-15,第2回,1回戦,Saburo,1,Shiro,1,1,Saburo
+    date,tournament,round,player_a,score_a,player_b,score_b,pk,pk_winner,seed
+    2025-06-01,第1回,1回戦,Taro,3,Jiro,1,0,,
+    2025-06-01,第1回,準決勝,Nagata,0,Jiro,0,1,Nagata,Nagata  ← Nagataがシード
+    2025-06-15,第2回,1回戦,Saburo,1,Shiro,1,1,Saburo,
+
+    seed列: その大会でシードの選手名を1回だけ書く（他は空欄）
 
 選手アイコン:
     icons/ フォルダに「選手名.png」(.jpg/.jpeg/.webp) を置くと表示されます。
@@ -266,25 +269,21 @@ def find_icon(name):
 # サイドバー：シード・配点（管理者のみ）
 # ──────────────────────────────────────────────
 def build_seeds_by_tournament(matches: pd.DataFrame) -> dict:
-    st.sidebar.markdown("---")
-    st.sidebar.header("🌟 シード選手設定")
-
-    tournaments = sorted(matches["tournament"].unique()) if matches is not None else []
+    """CSV の seed 列からシード選手を大会ごとに取得する。
+    seed列に選手名が書かれている行を探し、大会ごとにリストを作る。
+    同じ大会・同じ選手名は重複排除。
+    """
     seeds = {}
-
-    if not is_admin():
-        st.sidebar.caption("（管理者のみ変更可）")
-        # 一般ユーザーには空dict返す（シードなし扱い）
+    if matches is None or "seed" not in matches.columns:
         return seeds
 
-    for t in tournaments:
-        raw = st.sidebar.text_input(
-            f"{t} のシード選手",
-            key=f"seed_{t}",
-            help="カンマ区切りで複数可。例: Taro, Jiro"
-        )
-        seeds[t] = [s.strip() for s in raw.split(",") if s.strip()] if raw else []
-
+    for _, row in matches.iterrows():
+        t    = str(row["tournament"]).strip()
+        seed = str(row.get("seed", "")).strip()
+        if seed and seed.lower() not in ("", "nan", "none"):
+            seeds.setdefault(t, [])
+            if seed not in seeds[t]:
+                seeds[t].append(seed)
     return seeds
 
 
