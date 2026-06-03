@@ -54,15 +54,15 @@ def admin_login_widget():
             st.rerun()
         return
 
-    with st.sidebar.expander("🔒 管理者ログイン"):
-        pw = st.sidebar.text_input("パスワード", type="password", key="pw_input")
-        if st.sidebar.button("ログイン"):
-            correct = st.secrets.get("ADMIN_PASSWORD", "admin")
-            if pw == correct:
-                st.session_state["authenticated"] = True
-                st.rerun()
-            else:
-                st.sidebar.error("パスワードが違います")
+    st.sidebar.markdown("🔒 **管理者ログイン**")
+    pw = st.sidebar.text_input("パスワード", type="password", key="pw_input")
+    if st.sidebar.button("ログイン"):
+        correct = st.secrets.get("ADMIN_PASSWORD", "admin")
+        if pw == correct:
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.sidebar.error("パスワードが違います")
 
 
 # ──────────────────────────────────────────────
@@ -302,11 +302,11 @@ def build_round_config(matches: pd.DataFrame) -> dict:
     for rname in all_rounds:
         default = DEFAULT_ROUNDS.get(rname, {"win": 10, "pk_win": 7, "gd_bonus": 1})
         if is_admin():
-            with st.sidebar.expander(f"📋 {rname}"):
-                w = st.number_input("通常勝ち (pt)",          value=default["win"],      key=f"{rname}_win", step=1)
-                p = st.number_input("PK勝ち (pt)",            value=default["pk_win"],   key=f"{rname}_pk",  step=1)
-                g = st.number_input("得失点差ボーナス (pt/点)", value=default["gd_bonus"], key=f"{rname}_gd",  step=1)
-                config[rname] = {"win": w, "pk_win": p, "gd_bonus": g}
+            st.sidebar.markdown(f"**📋 {rname}**")
+            w = st.sidebar.number_input("通常勝ち (pt)",          value=default["win"],      key=f"{rname}_win", step=1)
+            p = st.sidebar.number_input("PK勝ち (pt)",            value=default["pk_win"],   key=f"{rname}_pk",  step=1)
+            g = st.sidebar.number_input("得失点差ボーナス (pt/点)", value=default["gd_bonus"], key=f"{rname}_gd",  step=1)
+            config[rname] = {"win": w, "pk_win": p, "gd_bonus": g}
         else:
             config[rname] = default
 
