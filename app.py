@@ -330,7 +330,10 @@ def render_standings(scores, stats):
         col_rank.markdown(f"### {medal}")
 
         icon = find_icon(name)
-        col_icon.image(icon, width=50) if icon else col_icon.markdown("### 👤")
+        if icon:
+            col_icon.image(icon, width=50)
+        else:
+            col_icon.markdown("### 👤")
 
         col_name.markdown(f"### {name}")
         delta = score - INITIAL_SCORE
