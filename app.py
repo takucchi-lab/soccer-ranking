@@ -55,14 +55,14 @@ def admin_login_widget():
         return
 
     with st.sidebar.expander("🔒 管理者ログイン"):
-        pw = st.text_input("パスワード", type="password", key="pw_input")
-        if st.button("ログイン"):
+        pw = st.sidebar.text_input("パスワード", type="password", key="pw_input")
+        if st.sidebar.button("ログイン"):
             correct = st.secrets.get("ADMIN_PASSWORD", "admin")
             if pw == correct:
                 st.session_state["authenticated"] = True
                 st.rerun()
             else:
-                st.error("パスワードが違います")
+                st.sidebar.error("パスワードが違います")
 
 
 # ──────────────────────────────────────────────
@@ -306,7 +306,7 @@ def build_round_config(matches: pd.DataFrame) -> dict:
                 w = st.number_input("通常勝ち (pt)",          value=default["win"],      key=f"{rname}_win", step=1)
                 p = st.number_input("PK勝ち (pt)",            value=default["pk_win"],   key=f"{rname}_pk",  step=1)
                 g = st.number_input("得失点差ボーナス (pt/点)", value=default["gd_bonus"], key=f"{rname}_gd",  step=1)
-            config[rname] = {"win": w, "pk_win": p, "gd_bonus": g}
+                config[rname] = {"win": w, "pk_win": p, "gd_bonus": g}
         else:
             config[rname] = default
 
