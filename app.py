@@ -117,6 +117,10 @@ def load_matches() -> pd.DataFrame | None:
             st.error(f"GitHubからのCSV取得に失敗しました: {e}")
             return None
 
+    # Excel等のエクスポートで付与される無名のindex列（先頭列）があれば除去
+    if len(df.columns) > 0 and (df.columns[0] in ("", "Unnamed: 0") or str(df.columns[0]).startswith("\ufeff")):
+        df = df.drop(columns=[df.columns[0]])
+
     required = {"date", "tournament", "round", "player_a", "score_a", "player_b", "score_b"}
     if not required.issubset(df.columns):
         st.error(f"必要な列が不足しています。\n必要: {required}\n実際: {list(df.columns)}")
@@ -151,6 +155,11 @@ def compute_points(matches: pd.DataFrame, round_config: dict, seeds_by_tournamen
     # 大会ごとにシードボーナスを付与したか追跡
     seed_bonus_applied = {}   # {tournament_name: bool}
 
+    # 大会が変わるタイミングで「その大会の開始時スコア」を記録する
+    tournament_order = list(matches["tournament"].astype(str).str.strip().unique())
+    current_tournament = None
+    tournament_start_scores = {}   # {tournament_name: {player: score_at_start}}
+
     for idx, row in matches.iterrows():
         a          = str(row["player_a"])
         b          = str(row["player_b"])
@@ -162,6 +171,11 @@ def compute_points(matches: pd.DataFrame, round_config: dict, seeds_by_tournamen
         pk_winner  = str(row.get("pk_winner","")).strip() if "pk_winner" in matches.columns else ""
 
         ensure(a); ensure(b)
+
+        # 大会が切り替わった瞬間に、登場済み全選手の現スコアを「開始時スコア」として保存
+        if tournament != current_tournament:
+            tournament_start_scores[tournament] = dict(scores)
+            current_tournament = tournament
 
         # この大会のシード選手
         seed_players = seeds_by_tournament.get(tournament, [])
@@ -249,6 +263,19 @@ def compute_points(matches: pd.DataFrame, round_config: dict, seeds_by_tournamen
         snap.update({p: round(s, 1) for p, s in scores.items()})
         history_rows.append(snap)
 
+    # 最新大会だけの獲得ポイント（前回大会終了時点からの差）を計算
+    if tournament_order:
+        latest_tournament = tournament_order[-1]
+        start_scores = tournament_start_scores.get(latest_tournament, {})
+        for name in scores:
+            start = start_scores.get(name, INITIAL_SCORE)
+            stats[name]["latest_tournament_gain"] = round(scores[name] - start, 1)
+            stats[name]["latest_tournament_name"] = latest_tournament
+    else:
+        for name in scores:
+            stats[name]["latest_tournament_gain"] = 0
+            stats[name]["latest_tournament_name"] = ""
+
     return scores, pd.DataFrame(history_rows), stats
 
 
@@ -335,8 +362,8 @@ def render_standings(scores, stats):
             col_icon.markdown("### 👤")
 
         col_name.markdown(f"### {name}")
-        delta = score - INITIAL_SCORE
-        col_score.metric("ポイント", f"{score:.0f}", delta=f"{delta:+.0f}")
+        latest_gain = s.get("latest_tournament_gain", 0)
+        col_score.metric("ポイント", f"{score:.0f}", delta=f"{latest_gain:+.0f}（今大会）")
 
         pk_str   = f"（うちPK {s['pk_wins']}）" if s["pk_wins"] > 0 else ""
         seed_str = f"　🌟累計ボーナス {s['seed_bonus_total']:+.1f}pt" if s["seed_bonus_total"] != 0 else ""
